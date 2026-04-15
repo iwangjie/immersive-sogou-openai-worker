@@ -1,0 +1,554 @@
+/**
+ * Cloudflare Worker: OpenAI-compatible chat/completions wrapper for
+ * https://fanyi.sogou.com/api/transpc/hunyuan/translate
+ *
+ * Dashboard deployment:
+ * 1. Cloudflare Dashboard -> Workers & Pages -> Create Worker
+ * 2. Paste this file into the editor
+ * 3. Settings -> Variables:
+ *    - AUTH_TOKEN   Optional. If set, clients must send:
+ *      Authorization: Bearer <AUTH_TOKEN>
+ *    - CONTEXT_MODE Optional. "on" by default. Set "off" to disable context wrapping.
+ *
+ * Immersive Translate suggested settings:
+ * - Base URL: https://your-worker.workers.dev/v1
+ * - API Key:  same as AUTH_TOKEN
+ * - Model:    sogou-hunyuan-translate
+ *
+ * Prompt template example:
+ *
+ * systemPrompt:
+ * You are a translation adapter.
+ * You must output only the translated content of the TEXT block.
+ * Do not explain anything.
+ * Do not return TITLE, SUMMARY, TERMS, XML tags, or any wrapper text.
+ * Preserve paragraph count, placeholder tags, Markdown, and %% separators.
+ *
+ * prompt / multiplePrompt / subtitlePrompt:
+ * <IMMERSIVE_PAYLOAD>
+ * <FROM>{{from}}</FROM>
+ * <TO>{{to}}</TO>
+ * <TITLE>{{title_prompt}}</TITLE>
+ * <SUMMARY>{{summary_prompt}}</SUMMARY>
+ * <TERMS>{{terms_prompt}}</TERMS>
+ * <TEXT>{{text}}</TEXT>
+ * </IMMERSIVE_PAYLOAD>
+ */
+
+const SOGOU_API_URL =
+  "https://fanyi.sogou.com/api/transpc/hunyuan/translate";
+const MODEL_ID = "sogou-hunyuan-translate";
+
+const JSON_HEADERS = {
+  "content-type": "application/json; charset=utf-8",
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,OPTIONS",
+  "access-control-allow-headers": "content-type,authorization",
+};
+
+const LANG_MAP = {
+  zh: "zh-CHS",
+  "zh-CN": "zh-CHS",
+  "zh-Hans": "zh-CHS",
+};
+
+function json(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...JSON_HEADERS,
+      ...extraHeaders,
+    },
+  });
+}
+
+function textResponse(body, headers = {}) {
+  return new Response(body, {
+    status: 200,
+    headers,
+  });
+}
+
+function normalizeLang(lang) {
+  if (!lang) return null;
+  if (lang === "auto") return "auto";
+  if (lang === "zh-TW" || lang === "zh-Hant" || lang === "zh-CHT") {
+    return null;
+  }
+  return LANG_MAP[lang] || lang;
+}
+
+function restoreLang(lang) {
+  return lang === "zh-CHS" ? "zh-CN" : lang;
+}
+
+function detectLang(text) {
+  if (/[\u3040-\u30ff]/.test(text)) return "ja";
+  if (/[\uac00-\ud7af]/.test(text)) return "ko";
+  if (/[\u4e00-\u9fff]/.test(text)) return "zh-CHS";
+  return "en";
+}
+
+function getContentText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .filter((item) => item && item.type === "text" && typeof item.text === "string")
+    .map((item) => item.text)
+    .join("\n");
+}
+
+function extractTagValue(input, tagName) {
+  const pattern = new RegExp(
+    `<${tagName}>([\\s\\S]*?)<\\/${tagName}>`,
+    "i",
+  );
+  const match = input.match(pattern);
+  return match ? match[1].trim() : "";
+}
+
+function extractTaggedPayload(messages) {
+  const combined = messages
+    .map((message) => getContentText(message.content))
+    .filter(Boolean)
+    .join("\n\n");
+
+  const payload = extractTagValue(combined, "IMMERSIVE_PAYLOAD") || combined;
+  const text = extractTagValue(payload, "TEXT");
+  const to = extractTagValue(payload, "TO");
+  const from = extractTagValue(payload, "FROM") || "auto";
+  const title = extractTagValue(payload, "TITLE");
+  const summary = extractTagValue(payload, "SUMMARY");
+  const terms = extractTagValue(payload, "TERMS");
+
+  return {
+    from,
+    to,
+    text,
+    context: {
+      title,
+      summary,
+      terms,
+    },
+  };
+}
+
+function extractTitleFromText(input) {
+  const patterns = [
+    /(?:^|\n)Title:\s*([^\n]+)/i,
+    /(?:^|\n)标题[：:]\s*([^\n]+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+    if (match) return match[1].trim();
+  }
+
+  return "";
+}
+
+function mapLanguageLabelToCode(label) {
+  if (!label) return null;
+
+  const value = label.trim().toLowerCase();
+  const mappings = [
+    { pattern: /^(简体中文|简中|中文简体|simplified chinese|chinese simplified)$/, code: "zh-CN" },
+    { pattern: /^(中文|汉语|中文简体版)$/, code: "zh-CN" },
+    { pattern: /^(繁体中文|繁中|traditional chinese|chinese traditional)$/, code: "zh-TW" },
+    { pattern: /^(英语|英文|english)$/, code: "en" },
+    { pattern: /^(日语|日文|japanese)$/, code: "ja" },
+    { pattern: /^(韩语|韩文|korean)$/, code: "ko" },
+  ];
+
+  for (const item of mappings) {
+    if (item.pattern.test(value)) return item.code;
+  }
+
+  return null;
+}
+
+function extractTargetLangFromText(input) {
+  const patterns = [
+    /翻译为\s*([^\n（(:：]+)\s*(?:（[^）]*）|\([^)]*\))?\s*[:：]/i,
+    /translate\s+to\s+([^\n(:：]+)\s*(?:\([^)]*\))?\s*[:：]/i,
+    /翻译成\s*([^\n（(:：]+)\s*(?:（[^）]*）|\([^)]*\))?\s*[:：]/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+    if (!match) continue;
+
+    const langCode = mapLanguageLabelToCode(match[1]);
+    if (langCode) return langCode;
+  }
+
+  return null;
+}
+
+function extractTextFromUserPrompt(input) {
+  const normalized = input.replace(/\r\n/g, "\n");
+  const separators = ["\n\n", "：\n", ":\n"];
+
+  for (const separator of separators) {
+    const index = normalized.indexOf(separator);
+    if (index >= 0) {
+      const value = normalized.slice(index + separator.length).trim();
+      if (value) return value;
+    }
+  }
+
+  const colonIndex = normalized.search(/[:：]/);
+  if (colonIndex >= 0) {
+    const value = normalized.slice(colonIndex + 1).trim();
+    if (value) return value;
+  }
+
+  return normalized.trim();
+}
+
+function extractPayloadFromDefaultMessages(messages) {
+  const systemText = messages
+    .filter((message) => message.role === "system")
+    .map((message) => getContentText(message.content))
+    .filter(Boolean)
+    .join("\n\n");
+
+  const userText = messages
+    .filter((message) => message.role === "user")
+    .map((message) => getContentText(message.content))
+    .filter(Boolean)
+    .join("\n\n");
+
+  if (!userText) return null;
+
+  const targetLang =
+    extractTargetLangFromText(userText) || extractTargetLangFromText(systemText);
+  const text = extractTextFromUserPrompt(userText);
+
+  if (!targetLang || !text) return null;
+
+  return {
+    from: "auto",
+    to: targetLang,
+    text,
+    context: {
+      title: extractTitleFromText(systemText),
+      summary: "",
+      terms: "",
+    },
+  };
+}
+
+function extractPayload(messages) {
+  const taggedPayload = extractTaggedPayload(messages);
+  if (taggedPayload.text && taggedPayload.to) {
+    return taggedPayload;
+  }
+
+  return extractPayloadFromDefaultMessages(messages);
+}
+
+function buildContextEnvelope(text, context) {
+  const chunks = [];
+
+  if (context.title) {
+    chunks.push(`<it_ctx_title>${context.title}</it_ctx_title>`);
+  }
+  if (context.summary) {
+    chunks.push(`<it_ctx_summary>${context.summary}</it_ctx_summary>`);
+  }
+  if (context.terms) {
+    chunks.push(`<it_ctx_terms>${context.terms}</it_ctx_terms>`);
+  }
+
+  if (chunks.length === 0) return text;
+
+  return `${chunks.join("\n")}\n<it_text>${text}</it_text>`;
+}
+
+function stripContextEnvelope(translatedText) {
+  return extractTagValue(translatedText, "it_text") || translatedText;
+}
+
+function buildChatCompletion(model, content, created) {
+  return {
+    id: `chatcmpl_${crypto.randomUUID()}`,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content,
+        },
+        finish_reason: "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    },
+  };
+}
+
+function buildStreamResponse(model, content, created) {
+  const encoder = new TextEncoder();
+  const id = `chatcmpl_${crypto.randomUUID()}`;
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const events = [
+        {
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant" },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: { content },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: "stop",
+            },
+          ],
+        },
+      ];
+
+      for (const event of events) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "access-control-allow-origin": "*",
+    },
+  });
+}
+
+function isAuthorized(request, env) {
+  const expectedToken = env.AUTH_TOKEN;
+  if (!expectedToken) return true;
+
+  const bearerToken = request.headers
+    .get("authorization")
+    ?.replace(/^Bearer\s+/i, "");
+
+  return bearerToken === expectedToken;
+}
+
+function isModelsPath(pathname) {
+  return pathname === "/v1/models" || pathname === "/models";
+}
+
+function isChatCompletionsPath(pathname) {
+  return pathname === "/v1/chat/completions" || pathname === "/chat/completions";
+}
+
+async function translateOne(text, sourceLang, targetLang) {
+  const response = await fetch(SOGOU_API_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json;charset=UTF-8",
+    },
+    body: JSON.stringify({
+      text,
+      from_lang: sourceLang,
+      to_lang: targetLang,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Upstream HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (data?.status !== 0 || data?.data?.code !== 0) {
+    throw new Error(data?.data?.message || "Sogou translation failed");
+  }
+
+  return {
+    detectedSourceLang: restoreLang(data?.data?.from_lang || sourceLang),
+    translatedText: data?.data?.content || "",
+  };
+}
+
+async function handleChatCompletions(request, env) {
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: { message: "Request body must be valid JSON" } }, 400);
+  }
+
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  if (messages.length === 0) {
+    return json({ error: { message: "messages must be a non-empty array" } }, 400);
+  }
+
+  const payload = extractPayload(messages);
+  if (!payload?.text || !payload?.to) {
+    return json(
+      {
+        error: {
+          message:
+            "Unable to extract payload. Supported formats: tagged prompt with <IMMERSIVE_PAYLOAD> or default translation prompt like '翻译为简体中文：...'",
+        },
+      },
+      400,
+    );
+  }
+
+  const targetLang = normalizeLang(payload.to);
+  const sourceLangInput = normalizeLang(payload.from);
+
+  if (!targetLang) {
+    return json(
+      { error: { message: `Unsupported target language: ${payload.to}` } },
+      400,
+    );
+  }
+
+  if (sourceLangInput !== "auto" && !sourceLangInput) {
+    return json(
+      { error: { message: `Unsupported source language: ${payload.from}` } },
+      400,
+    );
+  }
+
+  const sourceLang =
+    sourceLangInput === "auto" ? detectLang(payload.text) : sourceLangInput;
+  const includeContext = env.CONTEXT_MODE !== "off";
+  const upstreamText = includeContext
+    ? buildContextEnvelope(payload.text, payload.context)
+    : payload.text;
+
+  try {
+    const result = await translateOne(upstreamText, sourceLang, targetLang);
+    const translatedContent = includeContext
+      ? stripContextEnvelope(result.translatedText)
+      : result.translatedText;
+    const model = body?.model || MODEL_ID;
+    const created = Math.floor(Date.now() / 1000);
+
+    if (body?.stream === true) {
+      return buildStreamResponse(model, translatedContent, created);
+    }
+
+    return json(buildChatCompletion(model, translatedContent, created));
+  } catch (error) {
+    return json(
+      {
+        error: {
+          message:
+            error instanceof Error ? error.message : "Unknown upstream error",
+        },
+      },
+      502,
+    );
+  }
+}
+
+function handleHome(env) {
+  const authEnabled = Boolean(env.AUTH_TOKEN);
+  const lines = [
+    "immersive-sogou-openai-worker",
+    "",
+    "Endpoints:",
+    "  GET  /",
+    "  GET  /v1/models",
+    "  GET  /models",
+    "  POST /v1/chat/completions",
+    "  POST /chat/completions",
+    "",
+    `Auth: ${authEnabled ? "Bearer token required" : "disabled"}`,
+    `Context mode: ${env.CONTEXT_MODE || "on"}`,
+    "",
+    "Suggested Immersive Translate settings:",
+    "  Base URL: https://your-worker.workers.dev/v1",
+    "  API Key:  same as AUTH_TOKEN",
+    `  Model:    ${MODEL_ID}`,
+  ];
+
+  return textResponse(lines.join("\n"), {
+    "content-type": "text/plain; charset=utf-8",
+    "access-control-allow-origin": "*",
+  });
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: JSON_HEADERS });
+    }
+
+    if (request.method === "GET" && url.pathname === "/") {
+      return handleHome(env);
+    }
+
+    if (!isAuthorized(request, env)) {
+      return json(
+        { error: { message: "Unauthorized" } },
+        401,
+        { "www-authenticate": 'Bearer realm="immersive-sogou-openai-worker"' },
+      );
+    }
+
+    if (request.method === "GET" && isModelsPath(url.pathname)) {
+      return json({
+        object: "list",
+        data: [
+          {
+            id: MODEL_ID,
+            object: "model",
+            owned_by: "custom-worker",
+          },
+        ],
+      });
+    }
+
+    if (request.method === "POST" && isChatCompletionsPath(url.pathname)) {
+      return handleChatCompletions(request, env);
+    }
+
+    return json({ error: { message: "Not found" } }, 404);
+  },
+};
