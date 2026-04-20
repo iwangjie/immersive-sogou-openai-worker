@@ -83,9 +83,14 @@ function restoreLang(lang) {
 }
 
 function detectLang(text) {
-  if (/[\u3040-\u30ff]/.test(text)) return "ja";
-  if (/[\uac00-\ud7af]/.test(text)) return "ko";
-  if (/[\u4e00-\u9fff]/.test(text)) return "zh-CHS";
+  const japaneseCount = (text.match(/[\u3040-\u30ff]/g) || []).length;
+  const koreanCount = (text.match(/[\uac00-\ud7af]/g) || []).length;
+  const chineseCount = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latinCount = (text.match(/[A-Za-z]/g) || []).length;
+
+  if (japaneseCount > 0 && japaneseCount >= koreanCount) return "ja";
+  if (koreanCount > 0 && koreanCount > japaneseCount) return "ko";
+  if (chineseCount > 0 && chineseCount * 2 >= latinCount) return "zh-CHS";
   return "en";
 }
 
@@ -103,11 +108,18 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function buildTagNamePattern(tagName) {
+  return tagName
+    .split("")
+    .map((char) => escapeRegExp(char))
+    .join("\\s*");
+}
+
 function buildTagPattern(tagName, captureInnerText = true) {
-  const escapedTagName = escapeRegExp(tagName);
+  const tagNamePattern = buildTagNamePattern(tagName);
   const innerPattern = captureInnerText ? "([\\s\\S]*?)" : "[\\s\\S]*?";
   return new RegExp(
-    `<\\s*${escapedTagName}\\s*>${innerPattern}<\\s*\\/\\s*${escapedTagName}\\s*>`,
+    `<\\s*${tagNamePattern}\\s*>${innerPattern}<\\s*\\/\\s*${tagNamePattern}\\s*>`,
     "i",
   );
 }
@@ -163,12 +175,20 @@ function mapLanguageLabelToCode(label) {
 
   const value = label.trim().toLowerCase();
   const mappings = [
-    { pattern: /^(简体中文|简中|中文简体|simplified chinese|chinese simplified)$/, code: "zh-CN" },
+    {
+      pattern:
+        /^(简体中文|简中|中文简体|simplified chinese|chinese simplified)( language)?$/,
+      code: "zh-CN",
+    },
     { pattern: /^(中文|汉语|中文简体版)$/, code: "zh-CN" },
-    { pattern: /^(繁体中文|繁中|traditional chinese|chinese traditional)$/, code: "zh-TW" },
-    { pattern: /^(英语|英文|english)$/, code: "en" },
-    { pattern: /^(日语|日文|japanese)$/, code: "ja" },
-    { pattern: /^(韩语|韩文|korean)$/, code: "ko" },
+    {
+      pattern:
+        /^(繁体中文|繁中|traditional chinese|chinese traditional)( language)?$/,
+      code: "zh-TW",
+    },
+    { pattern: /^(英语|英文|english)( language)?$/, code: "en" },
+    { pattern: /^(日语|日文|japanese)( language)?$/, code: "ja" },
+    { pattern: /^(韩语|韩文|korean)( language)?$/, code: "ko" },
   ];
 
   for (const item of mappings) {
@@ -183,6 +203,7 @@ function extractTargetLangFromText(input) {
     /翻译为\s*([^\n（(:：]+)\s*(?:（[^）]*）|\([^)]*\))?\s*[:：]/i,
     /translate\s+to\s+([^\n(:：]+)\s*(?:\([^)]*\))?\s*[:：]/i,
     /翻译成\s*([^\n（(:：]+)\s*(?:（[^）]*）|\([^)]*\))?\s*[:：]/i,
+    /translate[\s\S]*?\binto\s+([a-z\u4e00-\u9fff -]+?)(?:\s+language)?(?:[.\n]|$)/i,
   ];
 
   for (const pattern of patterns) {
@@ -215,6 +236,92 @@ function extractTextFromUserPrompt(input) {
   }
 
   return normalized.trim();
+}
+
+function parseYamlScalar(rawValue) {
+  const value = rawValue.trim();
+
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+
+  return value;
+}
+
+function extractYamlTranslationItems(input) {
+  const yamlText = extractTagValue(input, "yaml");
+  if (!yamlText) return [];
+
+  const lines = yamlText.replace(/\r\n/g, "\n").split("\n");
+  const items = [];
+  let currentItem = null;
+
+  for (const line of lines) {
+    const idMatch = line.match(/^\s*-\s*id\s*:\s*(.+?)\s*$/);
+    if (idMatch) {
+      if (currentItem?.id && currentItem?.source) {
+        items.push(currentItem);
+      }
+
+      currentItem = {
+        id: parseYamlScalar(idMatch[1]),
+        source: "",
+      };
+      continue;
+    }
+
+    if (!currentItem) continue;
+
+    const sourceMatch = line.match(/^\s+source\s*:\s*(.+?)\s*$/);
+    if (sourceMatch) {
+      currentItem.source = parseYamlScalar(sourceMatch[1]);
+    }
+  }
+
+  if (currentItem?.id && currentItem?.source) {
+    items.push(currentItem);
+  }
+
+  return items;
+}
+
+function extractPayloadFromYamlMessages(messages) {
+  const systemText = messages
+    .filter((message) => message.role === "system")
+    .map((message) => getContentText(message.content))
+    .filter(Boolean)
+    .join("\n\n");
+
+  const userText = messages
+    .filter((message) => message.role === "user")
+    .map((message) => getContentText(message.content))
+    .filter(Boolean)
+    .join("\n\n");
+
+  if (!userText) return null;
+
+  const items = extractYamlTranslationItems(userText);
+  const targetLang =
+    extractTargetLangFromText(userText) || extractTargetLangFromText(systemText);
+
+  if (items.length === 0 || !targetLang) {
+    return null;
+  }
+
+  return {
+    from: "auto",
+    to: targetLang,
+    items,
+    outputFormat: "yaml-step-translation",
+    context: {
+      title: extractTitleFromText(systemText),
+      summary: "",
+      terms: "",
+    },
+  };
 }
 
 function extractPayloadFromDefaultMessages(messages) {
@@ -256,6 +363,11 @@ function extractPayload(messages) {
     return taggedPayload;
   }
 
+  const yamlPayload = extractPayloadFromYamlMessages(messages);
+  if (yamlPayload) {
+    return yamlPayload;
+  }
+
   return extractPayloadFromDefaultMessages(messages);
 }
 
@@ -281,12 +393,17 @@ function stripContextEnvelope(translatedText) {
   const extractedText = extractTagValue(translatedText, "it_text");
   if (extractedText) return extractedText;
 
+  const itTextTagPattern = new RegExp(
+    `<\\s*\\/?\\s*${buildTagNamePattern("it_text")}\\s*>`,
+    "gi",
+  );
+
   return ["it_ctx_title", "it_ctx_summary", "it_ctx_terms"]
     .reduce(
       (text, tagName) => text.replace(buildTagPattern(tagName, false), ""),
       translatedText,
     )
-    .replace(/<\s*\/?\s*it_text\s*>/gi, "")
+    .replace(itTextTagPattern, "")
     .trim();
 }
 
@@ -380,6 +497,23 @@ function buildStreamResponse(model, content, created) {
   });
 }
 
+function formatYamlValue(value) {
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) {
+    return value;
+  }
+
+  return JSON.stringify(value);
+}
+
+function buildYamlTranslationContent(items) {
+  return items
+    .map(
+      (item) =>
+        `- id: ${formatYamlValue(item.id)}\n  step1: ${formatYamlValue(item.step1)}\n  step2: ${formatYamlValue(item.step2)}`,
+    )
+    .join("\n");
+}
+
 function isAuthorized(request, env) {
   const expectedToken = env.AUTH_TOKEN;
   if (!expectedToken) return true;
@@ -427,6 +561,23 @@ async function translateOne(text, sourceLang, targetLang) {
   };
 }
 
+async function translateText(text, sourceLangInput, targetLang, includeContext, context) {
+  const sourceLang =
+    sourceLangInput === "auto" ? detectLang(text) : sourceLangInput;
+  if (sourceLang === targetLang) {
+    return text;
+  }
+
+  const upstreamText = includeContext
+    ? buildContextEnvelope(text, context)
+    : text;
+  const result = await translateOne(upstreamText, sourceLang, targetLang);
+
+  return includeContext
+    ? stripContextEnvelope(result.translatedText)
+    : result.translatedText;
+}
+
 async function handleChatCompletions(request, env) {
   let body;
 
@@ -442,7 +593,13 @@ async function handleChatCompletions(request, env) {
   }
 
   const payload = extractPayload(messages);
-  if (!payload?.text || !payload?.to) {
+  const hasTextPayload = Boolean(payload?.text);
+  const hasYamlPayload =
+    payload?.outputFormat === "yaml-step-translation" &&
+    Array.isArray(payload?.items) &&
+    payload.items.length > 0;
+
+  if ((!hasTextPayload && !hasYamlPayload) || !payload?.to) {
     return json(
       {
         error: {
@@ -471,20 +628,42 @@ async function handleChatCompletions(request, env) {
     );
   }
 
-  const sourceLang =
-    sourceLangInput === "auto" ? detectLang(payload.text) : sourceLangInput;
   const includeContext = env.CONTEXT_MODE !== "off";
-  const upstreamText = includeContext
-    ? buildContextEnvelope(payload.text, payload.context)
-    : payload.text;
 
   try {
-    const result = await translateOne(upstreamText, sourceLang, targetLang);
-    const translatedContent = includeContext
-      ? stripContextEnvelope(result.translatedText)
-      : result.translatedText;
     const model = body?.model || MODEL_ID;
     const created = Math.floor(Date.now() / 1000);
+    let translatedContent = "";
+
+    if (payload.outputFormat === "yaml-step-translation") {
+      const translatedItems = [];
+
+      for (const item of payload.items) {
+        const translatedText = await translateText(
+          item.source,
+          sourceLangInput,
+          targetLang,
+          includeContext,
+          payload.context,
+        );
+
+        translatedItems.push({
+          id: item.id,
+          step1: translatedText,
+          step2: translatedText,
+        });
+      }
+
+      translatedContent = buildYamlTranslationContent(translatedItems);
+    } else {
+      translatedContent = await translateText(
+        payload.text,
+        sourceLangInput,
+        targetLang,
+        includeContext,
+        payload.context,
+      );
+    }
 
     if (body?.stream === true) {
       return buildStreamResponse(model, translatedContent, created);
@@ -572,4 +751,9 @@ export default {
   },
 };
 
-export { extractTagValue, stripContextEnvelope };
+export {
+  buildYamlTranslationContent,
+  extractPayload,
+  extractTagValue,
+  stripContextEnvelope,
+};
