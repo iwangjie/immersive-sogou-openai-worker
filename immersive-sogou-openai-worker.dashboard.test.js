@@ -5,6 +5,7 @@ import {
   buildYamlTranslationContent,
   extractPayload,
   extractTagValue,
+  normalizeTagSpacing,
   stripContextEnvelope,
 } from "./immersive-sogou-openai-worker.dashboard.js";
 
@@ -40,6 +41,16 @@ test("stripContextEnvelope removes malformed closing it_text tags", () => {
   const input = '来自“ley nos/agent-helper-scripts”</it _ text >';
 
   assert.equal(stripContextEnvelope(input), '来自“ley nos/agent-helper-scripts”');
+});
+
+test("normalizeTagSpacing fixes broken HTML-like tags", () => {
+  const input =
+    '使用< code>forge setup</code >安装，然后无需输入< code>forge</code >。';
+
+  assert.equal(
+    normalizeTagSpacing(input),
+    "使用<code>forge setup</code>安装，然后无需输入<code>forge</code>。",
+  );
 });
 
 test("extractPayload supports YAML translation prompts", () => {

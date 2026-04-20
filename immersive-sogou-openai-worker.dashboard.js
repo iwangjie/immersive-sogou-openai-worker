@@ -407,6 +407,19 @@ function stripContextEnvelope(translatedText) {
     .trim();
 }
 
+function normalizeTagSpacing(text) {
+  return text.replace(
+    /<\s*(\/?)\s*([A-Za-z][A-Za-z0-9:-]*)(\s[^<>]*?)?\s*(\/?)>/g,
+    (_, closingSlash, tagName, rawAttributes = "", selfClosingSlash) => {
+      const attributes = rawAttributes.trim();
+      const serializedAttributes = attributes ? ` ${attributes}` : "";
+      const serializedSelfClosing = selfClosingSlash ? " /" : "";
+
+      return `<${closingSlash}${tagName}${serializedAttributes}${serializedSelfClosing}>`;
+    },
+  );
+}
+
 function buildChatCompletion(model, content, created) {
   return {
     id: `chatcmpl_${crypto.randomUUID()}`,
@@ -589,17 +602,18 @@ async function translateText(text, sourceLangInput, targetLang, includeContext, 
   const sourceLang =
     sourceLangInput === "auto" ? detectLang(text) : sourceLangInput;
   if (sourceLang === targetLang) {
-    return text;
+    return normalizeTagSpacing(text);
   }
 
   const upstreamText = includeContext
     ? buildContextEnvelope(text, context)
     : text;
   const result = await translateOne(upstreamText, sourceLang, targetLang);
-
-  return includeContext
+  const translatedText = includeContext
     ? stripContextEnvelope(result.translatedText)
     : result.translatedText;
+
+  return normalizeTagSpacing(translatedText);
 }
 
 async function handleChatCompletions(request, env) {
@@ -779,5 +793,6 @@ export {
   buildYamlTranslationContent,
   extractPayload,
   extractTagValue,
+  normalizeTagSpacing,
   stripContextEnvelope,
 };
