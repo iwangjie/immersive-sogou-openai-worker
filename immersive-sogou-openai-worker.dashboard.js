@@ -99,11 +99,21 @@ function getContentText(content) {
     .join("\n");
 }
 
-function extractTagValue(input, tagName) {
-  const pattern = new RegExp(
-    `<${tagName}>([\\s\\S]*?)<\\/${tagName}>`,
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildTagPattern(tagName, captureInnerText = true) {
+  const escapedTagName = escapeRegExp(tagName);
+  const innerPattern = captureInnerText ? "([\\s\\S]*?)" : "[\\s\\S]*?";
+  return new RegExp(
+    `<\\s*${escapedTagName}\\s*>${innerPattern}<\\s*\\/\\s*${escapedTagName}\\s*>`,
     "i",
   );
+}
+
+function extractTagValue(input, tagName) {
+  const pattern = buildTagPattern(tagName);
   const match = input.match(pattern);
   return match ? match[1].trim() : "";
 }
@@ -268,7 +278,16 @@ function buildContextEnvelope(text, context) {
 }
 
 function stripContextEnvelope(translatedText) {
-  return extractTagValue(translatedText, "it_text") || translatedText;
+  const extractedText = extractTagValue(translatedText, "it_text");
+  if (extractedText) return extractedText;
+
+  return ["it_ctx_title", "it_ctx_summary", "it_ctx_terms"]
+    .reduce(
+      (text, tagName) => text.replace(buildTagPattern(tagName, false), ""),
+      translatedText,
+    )
+    .replace(/<\s*\/?\s*it_text\s*>/gi, "")
+    .trim();
 }
 
 function buildChatCompletion(model, content, created) {
@@ -552,3 +571,5 @@ export default {
     return json({ error: { message: "Not found" } }, 404);
   },
 };
+
+export { extractTagValue, stripContextEnvelope };
