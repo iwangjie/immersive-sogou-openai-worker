@@ -502,7 +502,31 @@ function formatYamlValue(value) {
     return value;
   }
 
-  return JSON.stringify(value);
+  const stringValue = String(value);
+  const reservedWords = new Set([
+    "",
+    "null",
+    "true",
+    "false",
+    "yes",
+    "no",
+    "on",
+    "off",
+    "~",
+  ]);
+  const lowerValue = stringValue.toLowerCase();
+  const shouldQuote =
+    reservedWords.has(lowerValue) ||
+    /\r|\n/.test(stringValue) ||
+    /^\s|\s$/.test(stringValue) ||
+    /^[\-[\]{}#&*!|>'"%@`,]/.test(stringValue) ||
+    /:\s/.test(stringValue);
+
+  if (!shouldQuote) {
+    return stringValue;
+  }
+
+  return `'${stringValue.replace(/'/g, "''")}'`;
 }
 
 function buildYamlTranslationContent(items) {

@@ -99,8 +99,25 @@ test("buildYamlTranslationContent renders YAML array with step fields", () => {
     ]),
     [
       "- id: 1",
-      '  step1: "来自\\"lev-os/agents\\""',
-      '  step2: "来自\\"lev-os/agents\\""',
+      '  step1: 来自"lev-os/agents"',
+      '  step2: 来自"lev-os/agents"',
+    ].join("\n"),
+  );
+});
+
+test("buildYamlTranslationContent quotes only unsafe YAML scalars", () => {
+  assert.equal(
+    buildYamlTranslationContent([
+      {
+        id: "1",
+        step1: "400: Unable to extract payload",
+        step2: "true",
+      },
+    ]),
+    [
+      "- id: 1",
+      "  step1: '400: Unable to extract payload'",
+      "  step2: 'true'",
     ].join("\n"),
   );
 });
