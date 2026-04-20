@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyTerminology,
   buildYamlTranslationContent,
   extractPayload,
   extractTagValue,
+  extractTerminologyEntries,
   normalizeTagSpacing,
+  protectTerminology,
+  restoreTerminology,
   stripContextEnvelope,
 } from "./immersive-sogou-openai-worker.dashboard.js";
 
@@ -53,6 +57,48 @@ test("normalizeTagSpacing fixes broken HTML-like tags", () => {
   );
 });
 
+test("extractTerminologyEntries parses terms from system prompt", () => {
+  const input = [
+    "Required Terminology: For terms in `Terms ->`:",
+    "Terms -> ",
+    "'feat': 'feat', 'Commit': 'Commit'",
+  ].join("\n");
+
+  assert.deepEqual(extractTerminologyEntries(input), [
+    { source: "feat", target: "feat" },
+    { source: "Commit", target: "Commit" },
+  ]);
+});
+
+test("protectTerminology and restoreTerminology preserve exact terms", () => {
+  const terminology = [{ source: "feat", target: "feat" }];
+  const protectedResult = protectTerminology(
+    "feat: add independent batch proxy pool in {0}",
+    terminology,
+  );
+
+  assert.equal(
+    protectedResult.text,
+    "<it_term_0>feat</it_term_0>: add independent batch proxy pool in {0}",
+  );
+  assert.equal(
+    restoreTerminology(
+      "< it_term_0 >feat</it_term_0 >: 添加独立批处理代理池于 {0}",
+      protectedResult.placeholders,
+    ),
+    "feat: 添加独立批处理代理池于 {0}",
+  );
+});
+
+test("applyTerminology enforces source to target mapping on final text", () => {
+  assert.equal(
+    applyTerminology("feat: 添加独立批处理代理池于 {0}", [
+      { source: "feat", target: "feat" },
+    ]),
+    "feat: 添加独立批处理代理池于 {0}",
+  );
+});
+
 test("extractPayload supports YAML translation prompts", () => {
   const payload = extractPayload([
     {
@@ -91,6 +137,7 @@ test("extractPayload supports YAML translation prompts", () => {
       },
     ],
     outputFormat: "yaml-step-translation",
+    terminology: [],
     context: {
       title: "《Search Agent Skills - Filter by Category & Author | SkillsMP》",
       summary: "",
@@ -131,4 +178,28 @@ test("buildYamlTranslationContent quotes only unsafe YAML scalars", () => {
       "  step2: 'true'",
     ].join("\n"),
   );
+});
+
+test("extractPayload keeps terminology from default system prompt", () => {
+  const payload = extractPayload([
+    {
+      role: "system",
+      content: [
+        "你是一个专业的简体中文母语译者，需将文本流畅地翻译为简体中文。",
+        "",
+        "Required Terminology: For terms in `Terms ->`:",
+        "Terms -> ",
+        "'feat': 'feat'",
+      ].join("\n"),
+    },
+    {
+      role: "user",
+      content: "翻译为简体中文（仅输出译文内容）：\n\nfeat: add independent batch proxy pool by @kamill7779 in {0}",
+    },
+  ]);
+
+  assert.deepEqual(payload?.terminology, [
+    { source: "feat", target: "feat" },
+  ]);
+  assert.equal(payload?.context.terms, "'feat': 'feat'");
 });

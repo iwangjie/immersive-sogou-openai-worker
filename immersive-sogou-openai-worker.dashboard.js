@@ -115,12 +115,12 @@ function buildTagNamePattern(tagName) {
     .join("\\s*");
 }
 
-function buildTagPattern(tagName, captureInnerText = true) {
+function buildTagPattern(tagName, captureInnerText = true, global = false) {
   const tagNamePattern = buildTagNamePattern(tagName);
   const innerPattern = captureInnerText ? "([\\s\\S]*?)" : "[\\s\\S]*?";
   return new RegExp(
     `<\\s*${tagNamePattern}\\s*>${innerPattern}<\\s*\\/\\s*${tagNamePattern}\\s*>`,
-    "i",
+    global ? "gi" : "i",
   );
 }
 
@@ -168,6 +168,38 @@ function extractTitleFromText(input) {
   }
 
   return "";
+}
+
+function extractTermsSection(input) {
+  if (!input) return "";
+
+  const matches = [...input.matchAll(/(?:^|\n)Terms\s*->\s*/gi)];
+  const lastMatch = matches.at(-1);
+  if (!lastMatch || typeof lastMatch.index !== "number") {
+    return "";
+  }
+
+  return input.slice(lastMatch.index + lastMatch[0].length).trim();
+}
+
+function extractTerminologyEntries(input) {
+  const termsSection = extractTermsSection(input);
+  if (!termsSection) return [];
+
+  const entries = [];
+  const pattern =
+    /(['"])((?:\\.|(?!\1)[\s\S])*?)\1\s*:\s*(['"])((?:\\.|(?!\3)[\s\S])*?)\3/g;
+
+  for (const match of termsSection.matchAll(pattern)) {
+    const source = match[2].replace(/\\(['"])/g, "$1").trim();
+    const target = match[4].replace(/\\(['"])/g, "$1").trim();
+
+    if (!source) continue;
+
+    entries.push({ source, target: target || source });
+  }
+
+  return entries;
 }
 
 function mapLanguageLabelToCode(label) {
@@ -316,10 +348,11 @@ function extractPayloadFromYamlMessages(messages) {
     to: targetLang,
     items,
     outputFormat: "yaml-step-translation",
+    terminology: extractTerminologyEntries(systemText),
     context: {
       title: extractTitleFromText(systemText),
       summary: "",
-      terms: "",
+      terms: extractTermsSection(systemText),
     },
   };
 }
@@ -349,10 +382,11 @@ function extractPayloadFromDefaultMessages(messages) {
     from: "auto",
     to: targetLang,
     text,
+    terminology: extractTerminologyEntries(systemText),
     context: {
       title: extractTitleFromText(systemText),
       summary: "",
-      terms: "",
+      terms: extractTermsSection(systemText),
     },
   };
 }
@@ -418,6 +452,78 @@ function normalizeTagSpacing(text) {
       return `<${closingSlash}${tagName}${serializedAttributes}${serializedSelfClosing}>`;
     },
   );
+}
+
+function buildTermBoundaryPattern(term) {
+  const escapedTerm = escapeRegExp(term);
+  const startsWithWordChar = /^[A-Za-z0-9_]/.test(term);
+  const endsWithWordChar = /[A-Za-z0-9_]$/.test(term);
+  const prefix = startsWithWordChar ? "(?<![A-Za-z0-9_])" : "";
+  const suffix = endsWithWordChar ? "(?![A-Za-z0-9_])" : "";
+
+  return new RegExp(`${prefix}${escapedTerm}${suffix}`, "g");
+}
+
+function buildTerminologyTagName(index) {
+  return `it_term_${index}`;
+}
+
+function protectTerminology(text, terminology) {
+  if (!Array.isArray(terminology) || terminology.length === 0) {
+    return { text, placeholders: [] };
+  }
+
+  const placeholders = [];
+  let protectedText = text;
+  const sortedTerminology = [...terminology].sort(
+    (left, right) => right.source.length - left.source.length,
+  );
+
+  for (const entry of sortedTerminology) {
+    const pattern = buildTermBoundaryPattern(entry.source);
+    const tagName = buildTerminologyTagName(placeholders.length);
+
+    if (!pattern.test(protectedText)) {
+      continue;
+    }
+
+    pattern.lastIndex = 0;
+    protectedText = protectedText.replace(
+      pattern,
+      `<${tagName}>${entry.source}</${tagName}>`,
+    );
+    placeholders.push({
+      tagName,
+      source: entry.source,
+      target: entry.target || entry.source,
+    });
+  }
+
+  return {
+    text: protectedText,
+    placeholders,
+  };
+}
+
+function restoreTerminology(text, placeholders) {
+  return placeholders.reduce(
+    (value, item) =>
+      value.replace(buildTagPattern(item.tagName, false, true), item.target),
+    text,
+  );
+}
+
+function applyTerminology(text, terminology) {
+  if (!Array.isArray(terminology) || terminology.length === 0) {
+    return text;
+  }
+
+  return [...terminology]
+    .sort((left, right) => right.source.length - left.source.length)
+    .reduce((value, entry) => {
+      const pattern = buildTermBoundaryPattern(entry.source);
+      return value.replace(pattern, entry.target || entry.source);
+    }, text);
 }
 
 function buildChatCompletion(model, content, created) {
@@ -598,22 +704,39 @@ async function translateOne(text, sourceLang, targetLang) {
   };
 }
 
-async function translateText(text, sourceLangInput, targetLang, includeContext, context) {
+async function translateText(
+  text,
+  sourceLangInput,
+  targetLang,
+  includeContext,
+  context,
+  terminology = [],
+) {
+  const { text: protectedText, placeholders } = protectTerminology(
+    text,
+    terminology,
+  );
   const sourceLang =
-    sourceLangInput === "auto" ? detectLang(text) : sourceLangInput;
+    sourceLangInput === "auto" ? detectLang(protectedText) : sourceLangInput;
   if (sourceLang === targetLang) {
-    return normalizeTagSpacing(text);
+    return applyTerminology(
+      normalizeTagSpacing(restoreTerminology(protectedText, placeholders)),
+      terminology,
+    );
   }
 
   const upstreamText = includeContext
-    ? buildContextEnvelope(text, context)
-    : text;
+    ? buildContextEnvelope(protectedText, context)
+    : protectedText;
   const result = await translateOne(upstreamText, sourceLang, targetLang);
   const translatedText = includeContext
     ? stripContextEnvelope(result.translatedText)
     : result.translatedText;
 
-  return normalizeTagSpacing(translatedText);
+  return applyTerminology(
+    normalizeTagSpacing(restoreTerminology(translatedText, placeholders)),
+    terminology,
+  );
 }
 
 async function handleChatCompletions(request, env) {
@@ -683,6 +806,7 @@ async function handleChatCompletions(request, env) {
           targetLang,
           includeContext,
           payload.context,
+          payload.terminology,
         );
 
         translatedItems.push({
@@ -700,6 +824,7 @@ async function handleChatCompletions(request, env) {
         targetLang,
         includeContext,
         payload.context,
+        payload.terminology,
       );
     }
 
@@ -790,9 +915,13 @@ export default {
 };
 
 export {
+  applyTerminology,
   buildYamlTranslationContent,
   extractPayload,
   extractTagValue,
+  extractTerminologyEntries,
   normalizeTagSpacing,
+  protectTerminology,
+  restoreTerminology,
   stripContextEnvelope,
 };
